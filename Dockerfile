@@ -14,7 +14,7 @@ COPY src/ src/
 RUN pip install --no-cache-dir .
 
 # Run as non-root user
-RUN useradd -m -r mcpuser
+RUN useradd -m -r mcpuser && chown -R mcpuser /app
 USER mcpuser
 
 EXPOSE 8000
