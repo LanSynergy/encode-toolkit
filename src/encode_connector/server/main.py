@@ -12,8 +12,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal
+from urllib.parse import urlparse
+from pathlib import Path
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.staticfiles import StaticFiles
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -148,6 +158,63 @@ async def lifespan(server: FastMCP):
             await _client.close()
         if _tracker:
             _tracker.close()
+
+
+# --- Dokploy / Cloud Hosting Setup ---
+_mcp_api_key = os.environ.get("ENCODE_MCP_API_KEY", "").strip()
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Allow unrestricted access to public downloads
+        if request.url.path.startswith("/downloads/"):
+            return await call_next(request)
+        
+        # Protect all MCP server routes (SSE, messages, etc)
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return JSONResponse({"error": "Missing or invalid Authorization header"}, status_code=401)
+        
+        token = auth_header.split(" ")[1]
+        if token != _mcp_api_key:
+            return JSONResponse({"error": "Invalid API key"}, status_code=403)
+        
+        return await call_next(request)
+
+def get_public_url(local_path: str) -> str:
+    """Convert a local ./downloads path to a public URL if PAPER_SEARCH_BASE_URL is set.
+    For encode-toolkit, we use the same base URL since they're hosted together,
+    or ENCODE_BASE_URL if distinct."""
+    base_url = os.environ.get("ENCODE_BASE_URL", os.environ.get("PAPER_SEARCH_BASE_URL", "")).rstrip("/")
+    if not base_url or not local_path.startswith("./downloads"):
+        return local_path
+    
+    rel_path = os.path.relpath(local_path, ".")
+    return f"{base_url}/{rel_path}"
+
+def cleanup_downloads(max_age_hours=1):
+    """Background task to remove files older than max_age_hours."""
+    downloads_dir = "./downloads"
+    while True:
+        try:
+            if os.path.exists(downloads_dir):
+                now = time.time()
+                for filename in os.listdir(downloads_dir):
+                    filepath = os.path.join(downloads_dir, filename)
+                    if os.path.isfile(filepath):
+                        # Use modification time (mtime) instead of creation time
+                        file_age = now - os.path.getmtime(filepath)
+                        if file_age > (max_age_hours * 3600):
+                            try:
+                                os.remove(filepath)
+                                logger.info(f"Cleaned up old genomic file: {filepath}")
+                            except Exception as e:
+                                logger.error(f"Failed to delete {filepath}: {e}")
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
+        
+        # Sleep for 15 minutes before checking again
+        time.sleep(900)
+# -------------------------------------
 
 
 mcp = FastMCP(
@@ -510,7 +577,7 @@ async def encode_search_files(
 @mcp.tool(annotations=_DOWNLOAD, title="Download ENCODE Files")
 async def encode_download_files(
     file_accessions: list[str],
-    download_dir: str,
+    download_dir: str = "./downloads",
     organize_by: Literal["flat", "experiment", "format", "experiment_format"] = "flat",
     verify_md5: bool = True,
 ) -> str:
@@ -555,9 +622,14 @@ async def encode_download_files(
 
     # Download all files
     results = await downloader.download_batch(file_infos, download_dir, organize_by, verify_md5)
+    
+    serialized_results = _serialize(results)
+    for res in serialized_results:
+        if "file_path" in res and res["file_path"]:
+            res["file_path"] = get_public_url(res["file_path"])
 
     output = {
-        "downloaded": _serialize(results),
+        "downloaded": serialized_results,
         "errors": errors,
         "summary": {
             "total_requested": len(file_accessions),
@@ -633,7 +705,7 @@ async def encode_get_metadata(
 
 @mcp.tool(annotations=_DOWNLOAD, title="Batch Search and Download")
 async def encode_batch_download(
-    download_dir: str,
+    download_dir: str = "./downloads",
     file_format: str | None = None,
     output_type: str | None = None,
     output_category: str | None = None,
@@ -744,8 +816,13 @@ async def encode_batch_download(
     results = await downloader.download_batch(files, download_dir, organize_by, verify_md5)
     search_total = search_result["total"]
 
+    serialized_results = _serialize(results)
+    for res in serialized_results:
+        if "file_path" in res and res["file_path"]:
+            res["file_path"] = get_public_url(res["file_path"])
+
     output = {
-        "downloaded": _serialize(results),
+        "downloaded": serialized_results,
         "summary": {
             "total_found": search_total,
             "total_downloaded": len(results),
@@ -1537,7 +1614,37 @@ async def encode_get_references(
 
 def main():
     """Run the MCP server."""
-    mcp.run()
+    transport_name = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+    
+    if transport_name in ("http", "streamable-http", "sse"):
+        actual_transport = "streamable-http" if transport_name == "http" else transport_name
+        
+        # Ensure downloads directory exists
+        os.makedirs("./downloads", exist_ok=True)
+
+        original_app_method = mcp.streamable_http_app
+        def patched_app_method():
+            app = original_app_method()
+            if _mcp_api_key:
+                app.add_middleware(ApiKeyMiddleware)
+                logger.info("Authentication enabled.")
+            
+            # Mount downloads directory to serve genomic files publicly
+            app.mount("/downloads", StaticFiles(directory="./downloads"), name="downloads")
+            logger.info("Static file serving for /downloads enabled.")
+            return app
+        
+        mcp.streamable_http_app = patched_app_method
+        
+        # Start cleanup task in the background
+        cleanup_thread = threading.Thread(target=cleanup_downloads, daemon=True)
+        cleanup_thread.start()
+        logger.info("Background cleanup thread for downloads started.")
+        
+        logger.info(f"Starting ENCODE MCP server on {mcp.settings.host}:{mcp.settings.port} with {actual_transport} transport...")
+        mcp.run(transport=actual_transport)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

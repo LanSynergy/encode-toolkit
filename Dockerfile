@@ -17,5 +17,7 @@ RUN pip install --no-cache-dir .
 RUN useradd -m -r mcpuser
 USER mcpuser
 
-# The MCP server communicates via stdio
-ENTRYPOINT ["encode-mcp"]
+EXPOSE 8000
+
+# The MCP server will look for MCP_TRANSPORT and bind to 0.0.0.0
+ENTRYPOINT ["encode-toolkit"]
