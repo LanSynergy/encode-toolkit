@@ -219,6 +219,8 @@ def cleanup_downloads(max_age_hours=1):
 
 mcp = FastMCP(
     "ENCODE Project",
+    host=os.environ.get("MCP_HOST", "0.0.0.0"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
     instructions=(
         "Query and download genomics data from the ENCODE Project (encodeproject.org). "
         "Search experiments by assay type, organism, organ, biosample, target, and more. "
